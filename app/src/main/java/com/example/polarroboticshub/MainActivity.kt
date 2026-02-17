@@ -122,7 +122,7 @@ fun PolarRoboticsHub(modifier: Modifier = Modifier) {
     var deviceInfo by remember {mutableStateOf("foo")}
 
     Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("Upload Code")
+        Text("Check for devices.")
         Spacer(Modifier.height(20.dp))
         Button(onClick = {
 
