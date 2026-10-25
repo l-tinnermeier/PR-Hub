@@ -17,6 +17,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -128,7 +130,8 @@ private fun findCh340Device(manager: UsbManager): UsbDevice? {
     return manager.deviceList.values.firstOrNull { device ->
         val vendorId = device.vendorId
         val productId = device.productId
-        vendorId == 0x1A86 && productId == 0x7523
+        (vendorId == 0x1A86 && productId == 0x7523) || // CH340
+        (vendorId == 0x10C4 && productId == 0xEA60)    // CP210x
     }
 }
 
@@ -445,6 +448,7 @@ private fun SPIAttachFromROMDefault(): Boolean {
     val payload = le32(0) + byteArrayOf(0, 0, 0, 0)
     val response = sendCommand(0x0D, payload, timeoutMs = 3000) ?: return false
 
+    return TODO("Provide the return value")
 }
 //  READ_REG (0x0A) - the payload is a 32-bit address; response puts the read value in bytes [4..7]
 private fun readRegister(address: Int): Int? {
@@ -705,8 +709,17 @@ suspend fun tryBootloaderSyncNoReset(): Boolean = withContext(Dispatchers.IO) {
 /* COMPOSABLES */
 @Composable
 fun DeviceInfoDisplay(modifier: Modifier = Modifier, serialLog: String) {
-    Column(modifier = modifier.background(Color.Blue), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(text = serialLog, modifier = modifier.padding(50.dp), color = Color.White)
+    val scrollState = rememberScrollState()
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(240.dp)
+            .background(Color.Blue)
+            .verticalScroll(scrollState)
+            .padding(16.dp)
+    ) {
+        Text(text = serialLog, color = Color.White)
     }
 }
 
