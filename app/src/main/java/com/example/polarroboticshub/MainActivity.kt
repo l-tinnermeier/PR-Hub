@@ -58,6 +58,8 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 
+private val esp = KotlinESP()
+
 private const val ACTION_USB_PERMISSION = "com.example.polarroboticshub.USB_PERMISSION"
 
 private object SerialSession {
@@ -390,38 +392,12 @@ private fun le32(value: Int): ByteArray = byteArrayOf(
     ((value ushr 24) and 0xFF).toByte()
 )
 
-private fun readLe32(bytes: ByteArray, offset: Int): Int {
-    return (bytes[offset].toInt() and 0xFF) or
-            ((bytes[offset + 1].toInt() and 0xFF) shl 8) or
-            ((bytes[offset + 2].toInt() and 0xFF) shl 16) or
-            ((bytes[offset + 3].toInt() and 0xFF) shl 24)
-}
-
-// Checksum used by the ROM protocol for some commands
-//  Starts at 0xEF, add a XOR each payload byte
-private fun checksumXOREf(payload: ByteArray): Int {
-    var checksum = 0xEF
-    for (byte in payload) checksum = checksum xor (byte.toInt() and 0xFF)
-    return checksum and 0xFF
-}
 
 // Send a bootloader command and wait for the matching response packet
 // NOTE: Caller should have the chip in "download" mode
 private fun sendCommand(command: Int, payload: ByteArray, timeoutMs: Long = 3000): ByteArray? {
     val port = SerialSession.port ?: return null
-    val size = payload.size
-    val checksum = checksumXOREf(payload)
-
-    val header = byteArrayOf(
-        0x00, // direction (request)
-        (command and 0xFF).toByte(),
-        (size and 0xFF).toByte(),
-        ((size ushr 8) and 0xFF).toByte(),
-        (checksum and 0xFF).toByte(),
-        0x00, 0x00, 0x00 // Checksum as LE32 (only low byte used for XOR checksum since im a dumb dumn)
-    )
-
-    val packet = slipEncode(header + payload)
+    val packet = esp.generateCommand(command, payload, timeoutMs)
     try {
         port.write(packet, 1000)
     } catch (_: Exception) {
@@ -455,57 +431,20 @@ private fun readRegister(address: Int): Int? {
     val response = sendCommand(0x0A, le32(address), timeoutMs = 3000) ?: return null
 
     if (response.size < 8) return null
-    return readLe32(response, 4)
+    return esp.decodeRegisterResponse(response)
 }
 
 //  The ESP32's base MAC address is stored in eFuse BLK0 read-data registers:
 //      - bits [31:0] are stored in EFUSE_BLK0_RDATA1_REG
 //      - bits [55:32] are stores in EFUSE_BLK0_RDATA_2_REG[23:0]
+
+// something aint right here, byte order looks wrong
+// supposed MAC address (pocket ESP): 78:1C:3C:2D:67:D8
 private fun readMacAddressFromEfuse(): String? {
     val w1 = readRegister(0x3FF5A004) ?: return null //     EFUSE_BLK0_RDATA1_REG
     val w2 = readRegister(0x3FF5A008) ?: return null //     EFUSE_BLK0_RDATA2_REG
 
-    // DEBUG
-    // SerialSession.onStatus?.invoke("EFUSE w1=%08X w2=%08X".format(w1, w2))
-
-    val byte6 = (w1 ushr 16) and 0xFF
-    val byte7 = (w1 ushr 24) and 0xFF
-    val byte8 = (w2 ushr 0) and 0xFF
-    val byte9 = (w2 ushr 8) and 0xFF
-    val byte10 = (w2 ushr 16) and 0xFF
-    val byte11 = (w2 ushr 24) and 0xFF
-
-    return "%02X:%02X:%02X:%02X:%02X:%02X".format(byte11, byte10, byte9, byte8, byte7, byte6)
-}
-
-// Creates a slip packet to send to the ESP
-private fun slipEncode(payload: ByteArray): ByteArray {
-    // Accounting for the command packet using the first 2 bytes of the payload for packet information
-    val output = ArrayList<Byte>(payload.size + 2)
-
-    // Every SLIP packet starts and ends with '0xC0'
-    output.add(0xC0.toByte())
-
-    // All occurrences of the byte '0xC0' are replaced with '0xDB 0xDC'
-    // All occurrences of the byte '0xDB' are replaced with '0xDB 0xDD'
-    //  This splits the raw byte stream into readable frames
-    for (byte in payload) {
-        when (byte) {
-            0xC0.toByte() -> {
-                output.add(0xDB.toByte())
-                output.add(0xDC.toByte())
-            }
-            0xDB.toByte() -> {
-                output.add(0xDB.toByte())
-                output.add(0xDD.toByte())
-            }
-            else -> output.add(byte)
-        }
-    }
-
-    // '0xC0' sandwich
-    output.add(0xC0.toByte())
-    return output.toByteArray()
+    return esp.decodeMac(w1, w2);
 }
 
 // Reading SLIP packets sent from ESP
@@ -634,7 +573,7 @@ suspend fun tryBootloaderSync(): Boolean = withContext(Dispatchers.IO) {
             0x00, 0x00, 0x00, 0x00 // checksum
         )
 
-        val packet = slipEncode(header + data)
+        val packet = esp.encodeSlip(header + data)
         port.write(packet, 1000)
 
         // Read until the ESP sends a "response" packet starting with
@@ -672,7 +611,7 @@ suspend fun tryBootloaderSyncNoReset(): Boolean = withContext(Dispatchers.IO) {
         0x00, 0x00, 0x00, 0x00
     )
 
-    val packet = slipEncode(header + data)
+    val packet = esp.encodeSlip(header + data)
     fun drain(ms: Long) {
         val buffer = ByteArray(256)
         val start = System.currentTimeMillis()
