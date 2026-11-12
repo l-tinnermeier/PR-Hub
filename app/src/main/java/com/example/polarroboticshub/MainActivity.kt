@@ -56,9 +56,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.security.MessageDigest
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.CancellationException
 
 
 private val esp = KotlinESP()
+private val decoder = SlipDecoder()
 
 private const val ACTION_USB_PERMISSION = "com.example.polarroboticshub.USB_PERMISSION"
 
@@ -66,8 +72,9 @@ private object SerialSession {
     var connection: android.hardware.usb.UsbDeviceConnection? = null
     var port: UsbSerialPort? = null
     var device: UsbDevice? = null
+    var bootloaderReady by mutableStateOf(false)
 
-    private var executor: ExecutorService? = null
+    @Volatile private var executor: ExecutorService? = null
     private var mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile var onText: ((String) -> Unit)? = null
@@ -77,10 +84,11 @@ private object SerialSession {
         val port = port ?: return
         stopIO()
 
+
         executor = Executors.newSingleThreadExecutor().also { exec ->
             exec.execute {
                 val buffer = ByteArray(1024)
-                while (!Thread.currentThread().isInterrupted) {
+                while (!exec.isShutdown && !Thread.currentThread().isInterrupted) {
                     try {
                         val n = port.read(buffer, 200)
                         if (n > 0) {
@@ -94,8 +102,10 @@ private object SerialSession {
                         }
                     } catch (e: Exception) {
                         mainHandler.post {
-                            onStatus?.invoke("Serial read error (unplug?)")
-                            closeConnection()
+                            if (executor === exec && !exec.isShutdown) {
+                                onStatus?.invoke("Serial read error: ${e.message}")
+                                closeConnection()
+                            }
                         }
                         break
                     }
@@ -111,7 +121,22 @@ private object SerialSession {
         executor = null
     }
 
+    // A specific stopping function that lets the current read finish before cutting
+    // Prevents two readers from opening on the same port
+    fun pauseMonitorForBootloader(): Boolean {
+        val reader = executor ?: return true
+        reader.shutdown()
+
+        return try {
+            reader.awaitTermination(1, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (_: Exception) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
     fun closeConnection() {
+        bootloaderReady = false
         stopIO()
         try {
             port?.close()
@@ -392,12 +417,39 @@ private fun le32(value: Int): ByteArray = byteArrayOf(
     ((value ushr 24) and 0xFF).toByte()
 )
 
+// Reading SLIP packets sent from ESP
+private fun slipTryToReadPacket(timeoutMsTotal: Long = 1500): ByteArray? {
+    // Grabbing current serial connection
+    val port = SerialSession.port ?: return null
+
+    // Checking for remnants from a previous USB read
+    decoder.nextPacket()?.let { return it }
+
+    // Reading information continuously for the given value of `timeoutMSTotal`
+    val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMsTotal
+    val buffer = ByteArray(1024)
+
+    while (true) {
+        val remaining = deadline - android.os.SystemClock.elapsedRealtime()
+
+        if (remaining <= 0) return null
+
+        val count = try { port.read(buffer, minOf(remaining, 50L).toInt()) }
+                    catch (_: Exception) { return null }
+
+        if (count > 0) {
+            decoder.feed(buffer, count)
+            decoder.nextPacket()?.let { return it }
+        }
+    }
+    return null
+}
 
 // Send a bootloader command and wait for the matching response packet
 // NOTE: Caller should have the chip in "download" mode
 private fun sendCommand(command: Int, payload: ByteArray, timeoutMs: Long = 3000): ByteArray? {
     val port = SerialSession.port ?: return null
-    val packet = esp.generateCommand(command, payload, timeoutMs)
+    val packet = esp.generateCommand(command, payload)
     try {
         port.write(packet, 1000)
     } catch (_: Exception) {
@@ -408,24 +460,41 @@ private fun sendCommand(command: Int, payload: ByteArray, timeoutMs: Long = 3000
     while (System.currentTimeMillis() - startTime < timeoutMs) {
         val response = slipTryToReadPacket(800) ?: continue
 
-        //  Response header: dir, cmd, size(2), value(4), data...
-        if (response.size < 8) continue
-        if (response[0] != 0x01.toByte()) continue
-        if ((response[1].toInt() and 0xFF) != (command and 0xFF)) continue
-        return response
+        //  Response header: dir, cmd, size(2), value(4), data... (now handled by checkROMReply)
+        when (esp.checkROMReply(response, command)) {
+            KotlinESP.Reply.OK -> return response
+            KotlinESP.Reply.OTHER_COMMAND -> continue
+            KotlinESP.Reply.MALFORMED -> return null
+            KotlinESP.Reply.DEVICE_ERROR -> {
+                // Pulling error code from the third-to-last byte
+                val error = response[response.size - 3].toInt() and 0xFF
+                android.util.Log.w("EspROM", "Command %02X failed: %02X".format(command, error))
+                return null
+            }
+        }
     }
     return null
 }
 
-// SPI_ATTACH Implementation (0x0D)
-private fun SPIAttachFromROMDefault(): Boolean {
-    // 0 = default SPI flash pins and e/Fuse configuration
-    //  ROM loader requires 4 exta bytes
-    val payload = le32(0) + byteArrayOf(0, 0, 0, 0)
-    val response = sendCommand(0x0D, payload, timeoutMs = 3000) ?: return false
-
-    return TODO("Provide the return value")
+// To send SPI_ATTACH, send 0x0D to the ESP with two four-byte all-zero words (to select the default flash config)
+private fun attachDefaultFlash(): Boolean {
+    return sendCommand(0x0D, ByteArray(8)) != null
 }
+
+// Following the ESP protocol's format for preparing to flash:
+//  https://github.com/espressif/esptool/blob/master/esptool/loader.py
+private fun setFlashParameters(sizeBytes: Int): Boolean {
+    require (sizeBytes > 0)
+    val payload = le32(0) +             // Flash ID
+                  le32(sizeBytes) +     // Configured flash size
+                  le32(64 * 1024) +     // Block size
+                  le32(4 * 1024) +      // Sector size
+                  le32(256) +           // Page size
+                  le32(0xFFFF)          // Status mask
+
+    return sendCommand(0x0B, payload) != null;
+}
+
 //  READ_REG (0x0A) - the payload is a 32-bit address; response puts the read value in bytes [4..7]
 private fun readRegister(address: Int): Int? {
     val response = sendCommand(0x0A, le32(address), timeoutMs = 3000) ?: return null
@@ -447,76 +516,7 @@ private fun readMacAddressFromEfuse(): String? {
     return esp.decodeMac(w1, w2);
 }
 
-// Reading SLIP packets sent from ESP
-private fun slipTryToReadPacket(timeoutMsTotal: Long = 1500): ByteArray? {
-    // Grabbing current serial connection
-    val port = SerialSession.port ?: return null
 
-    // Setting information to begin reading SLIP packets sent from the ESP
-    val start = System.currentTimeMillis()
-    val buffer = ByteArray(64)
-    val frame = ArrayList<Byte>(256)
-    var inFrame = false
-
-    // Reading SLIP packets
-    while (System.currentTimeMillis() - start < timeoutMsTotal) {
-        // Checking if there's any packets left to read
-        val n = try { port.read(buffer, 50) } catch (_: Exception) { return null }
-        if (n <= 0) continue
-
-        // Scanning for an ESC
-        for (i in 0 until n) {
-            val byte = buffer[i]
-            if (byte == 0xC0.toByte()) {
-                if (inFrame && frame.isNotEmpty()) {
-                    // At the end of a frame; return it for reading
-                    return slipUnescape(frame.toByteArray())
-                } else {
-                    // At the start of a frame; begin reading
-                    frame.clear()
-                    inFrame = true
-                }
-            } else if (inFrame) {
-                frame.add(byte)
-            }
-        }
-    }
-    return null
-}
-
-// Parsing a SLIP frame sent from the ESP
-private fun slipUnescape(data: ByteArray): ByteArray {
-    // No need to account for header data as frame is already split
-    val output = ArrayList<Byte>(data.size)
-    var i = 0
-
-    while (i < data.size) {
-        val currentByte = data[i]
-        if (currentByte == 0xDB.toByte() && i + 1 < data.size) {
-            val n = data[i + 1]
-
-            // Reverting the SLIP information back into its original form
-            // by replacing all Transposed Frame information with regular Frame information
-            when (n) {
-                0xDC.toByte() -> output.add(0xC0.toByte())
-                0xDD.toByte() -> output.add(0xDB.toByte())
-                else -> {
-                    output.add(currentByte)
-                    output.add(n)
-                }
-            }
-            i += 2
-        } else {
-            output.add(currentByte)
-            i++
-        }
-
-        // i is two different values to jump over the header information if it is at the begining
-        // of a packet
-    }
-
-    return output.toByteArray()
-}
 
 /* --------------------------------- */
 // ESP-IDF BOOTLOADER IMPLEMENTATION //
@@ -545,7 +545,8 @@ suspend fun tryBootloaderSync(): Boolean = withContext(Dispatchers.IO) {
     val port = SerialSession.port ?: return@withContext false
 
     // Pausing background reader to prevent interference
-    SerialSession.stopIO()
+    if (!SerialSession.pauseMonitorForBootloader()) return@withContext false
+    decoder.reset()
     var success = false
 
     try {
@@ -582,7 +583,7 @@ suspend fun tryBootloaderSync(): Boolean = withContext(Dispatchers.IO) {
 
             // Somethign about skipping over the packet header
             val response = slipTryToReadPacket(800) ?: return@repeat
-            if (response.size >=2 && response[0] == 0x01.toByte() && response[1] == 0x08.toByte()) {
+            if (esp.checkROMReply(response, 0x08) == KotlinESP.Reply.OK) {
                 success = true
                 return@withContext true
             }
@@ -595,7 +596,8 @@ suspend fun tryBootloaderSync(): Boolean = withContext(Dispatchers.IO) {
 
 suspend fun tryBootloaderSyncNoReset(): Boolean = withContext(Dispatchers.IO) {
     val port = SerialSession.port ?: return@withContext false
-    SerialSession.stopIO()
+    if (!SerialSession.pauseMonitorForBootloader()) return@withContext false
+    decoder.reset()
     var success = false
 
     // SYNC Packet
@@ -631,7 +633,7 @@ suspend fun tryBootloaderSyncNoReset(): Boolean = withContext(Dispatchers.IO) {
 
             repeat(6) {
                 val response = slipTryToReadPacket(800) ?: return@repeat
-                if (response.size >=2 && response[0] == 0x01.toByte() && response[1] == 0x08.toByte()) {
+                if (esp.checkROMReply(response, 0x08) == KotlinESP.Reply.OK) {
                     success = true
                     return@withContext true
                 }
@@ -643,6 +645,83 @@ suspend fun tryBootloaderSyncNoReset(): Boolean = withContext(Dispatchers.IO) {
         if (!success) SerialSession.startIO()
     }
 
+}
+
+// diabolical flashing function of doom and despair
+// Caller must own the serial connection exclusively:
+// busy=true, successful SYNC, and background reader stopped.
+//
+// regionSize is the available destination region, not the file size.
+// onProgress runs on Dispatchers.IO, but can switch to Dispatchers.Main for UI updates
+private suspend fun flashBinary(image: ByteArray, offset: Int, regionSize: Int, onProgress: suspend (written: Int, total: Int) -> Unit = { _, _ -> }):
+                                Unit = withContext(Dispatchers.IO) {
+    val flashSize = 2 * 1024 * 1024
+    val blockSize = 1024
+
+    require(image.isNotEmpty() && image.size <= flashSize)
+    require(offset >= 0 && offset % 4096 == 0)
+    require(regionSize > 0 && regionSize % 4096 == 0)
+
+    val eraseSize = ((image.size + 4095) / 4096) * 4096
+
+    require(eraseSize <= regionSize) {"Image exceeds the selected destination region"}
+    require(offset.toLong() + regionSize <= flashSize.toLong()) {"Destination exceeds the configured 2 MB flash"}
+
+    val activePort = checkNotNull(SerialSession.port) {"No serial connection"}
+
+    suspend fun requireActiveConnection() {
+        currentCoroutineContext().ensureActive()
+        check(SerialSession.port === activePort) {"Serial connection changed during flashing"}
+    }
+
+    suspend fun command(opcode: Int, payload: ByteArray, timeoutMs: Long, failureMessage: String): ByteArray {
+        requireActiveConnection()
+        return checkNotNull(sendCommand(opcode, payload, timeoutMs)) {failureMessage}
+    }
+
+    command(0x0D, ByteArray(8), 3000, "Could not attach flash")
+
+    // Configure flash for this 2 MB test profile.
+    requireActiveConnection()
+    check(setFlashParameters(flashSize)) {"Could not configure flash"}
+
+    command(0x02, esp.buildFlashBeginPayload(image.size, offset), 120_000, "FLASH_BEGIN failed or timed out")
+
+    onProgress(0, image.size)
+
+    val blockCount = (image.size + blockSize - 1) / blockSize
+
+    for (sequence in 0 until blockCount) {
+        val start = sequence * blockSize
+        val end = minOf(start + blockSize, image.size)
+
+        // Always transmit a full block. Unused bytes stay erased (0xFF).
+        val block = ByteArray(blockSize) { 0xFF.toByte() }
+        image.copyInto(destination = block, destinationOffset = 0, startIndex = start, endIndex = end)
+
+        command(0x03, esp.buildFlashDataPacket(sequence, block), 5000, "FLASH_DATA failed at block $sequence of $blockCount")
+
+        onProgress(end, image.size)
+    }
+
+    // Verify the original file bytes, excluding final-block padding.
+    val reply = command(
+        0x13,
+        le32(offset) + le32(image.size) + le32(0) + le32(0),
+        60_000,
+        "Flash verification command failed"
+    )
+
+    // Classic ESP32 ROM: 8-byte header + 32 ASCII MD5 bytes
+    // + 4 status bytes. sendCommand already checked the status.
+    check(reply.size == 44) {"Unexpected MD5 response length: ${reply.size}"}
+
+    val actualMd5 = String(reply, 8, 32, Charsets.US_ASCII)
+    val expectedMd5 = MessageDigest.getInstance("MD5").digest(image).joinToString("") {
+        "%02x".format(it.toInt() and 0xFF)
+    }
+
+    check(actualMd5.equals(expectedMd5, ignoreCase = true)) {"Verification failed: expected $expectedMd5, received $actualMd5"}
 }
 
 /* COMPOSABLES */
@@ -668,7 +747,7 @@ fun PolarRoboticsHub(modifier: Modifier = Modifier) {
     var usbManager: UsbManager
     var deviceInfo by remember {mutableStateOf("foo")}
     var serialLog by remember {mutableStateOf("")}
-    var bootloaderReady by remember {mutableStateOf(false)}
+    var busy by remember {mutableStateOf(false)}
 
     SerialSession.onText = { text ->
         serialLog += text
@@ -684,70 +763,220 @@ fun PolarRoboticsHub(modifier: Modifier = Modifier) {
         Spacer(Modifier.height(20.dp))
 
 
-        val scope = remember { CoroutineScope(Dispatchers.Main) }
+        val scope = rememberCoroutineScope()
 
         Button(onClick = {
             val manager = context.getSystemService(UsbManager::class.java)!!
             val dev = findCh340Device(manager)
             deviceInfo = if (dev == null) "No CH340 device found" else describeDevice(dev)
             openCh340OrRequestPermission(context)
-        }) { Text("Open (CH340)") }
+        }, enabled = !busy) { Text("Open (CH340)") }
 
         Spacer(Modifier.height(10.dp))
 
         Button(onClick = {
             SerialSession.closeConnection()
-        }) { Text("Close") }
+        }, enabled = !busy) { Text("Close") }
 
         Spacer(Modifier.height(10.dp))
 
         Button(onClick = {
-            scope.launch {
-                val ok = tryBootloaderSync()
-                Toast.makeText(context, if (ok) "Bootloader SYNC Success" else "SYNC failed (hold BOOT?)", Toast.LENGTH_SHORT).show()
-                deviceInfo = if (ok) "Bootloader SYNC Success" else "SYNC failed — try holding BOOT while pressing this"
-            }
-        }) { Text("Bootloader SYNC") }
-
-        Button(onClick = {
-            scope.launch {
-                val ok = tryBootloaderSyncNoReset()
-                Toast.makeText(
-                    context,
-                    if (ok) "SYNC (no reset) success" else "SYNC (no reset) failed ",
-                    Toast.LENGTH_SHORT
-                ).show()
-                if (ok) {
-                    deviceInfo = "Bootloader connected; ready to flash"
-                    bootloaderReady = true
+            if (!busy) {
+                busy = true
+                val syncingPort = SerialSession.port
+                SerialSession.bootloaderReady = false
+                scope.launch {
+                    try {
+                        val ok = tryBootloaderSync()
+                        SerialSession.bootloaderReady = ok && syncingPort != null && SerialSession.port === syncingPort
+                        Toast.makeText(context, if (ok) "Bootloader SYNC Success" else "SYNC failed (hold BOOT?)", Toast.LENGTH_SHORT).show()
+                        deviceInfo = if (ok) "Bootloader SYNC Success" else "SYNC failed — try holding BOOT while pressing this"
+                    } finally {
+                        busy = false
+                    }
                 }
             }
-        }) { Text("SYNC (no reset)") }
+        },
+            enabled = !busy) { Text("Bootloader SYNC") }
+
+        Button(onClick = {
+            if (!busy) {
+                busy = true
+                val syncingPort = SerialSession.port
+                SerialSession.bootloaderReady = false
+                scope.launch {
+                    try {
+                        val ok = tryBootloaderSyncNoReset()
+                        SerialSession.bootloaderReady = ok && syncingPort != null && SerialSession.port === syncingPort
+                        Toast.makeText(
+                            context,
+                            if (ok) "SYNC (no reset) success" else "SYNC (no reset) failed ",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        if (ok) {
+                            deviceInfo = "Bootloader connected; ready to flash"
+                        }
+                    } finally {
+                        busy = false
+                    }
+                }
+            }
+        },
+            enabled = !busy
+        ) { Text("SYNC (no reset)") }
 
         Spacer(Modifier.height(10.dp))
 
         Button(
             onClick = {
-                scope.launch {
-                    // Ensure background reader is stopped during bootloader commands
-                    SerialSession.stopIO()
-                    val mac = withContext(Dispatchers.IO) { readMacAddressFromEfuse() }
-                    if (mac == null) {
-                        Toast.makeText(context, "Read MAC failed", Toast.LENGTH_SHORT).show()
-                        deviceInfo = "Read MAC failed (is chip in download mode?)"
-                        bootloaderReady = false
-                        // Resume normal reader so app isn’t stuck
-                        SerialSession.startIO()
-                    } else {
-                        Toast.makeText(context, "MAC: $mac", Toast.LENGTH_SHORT).show()
-                        deviceInfo = "Base MAC: $mac"
-                        // Keep bootloaderReady true; keep reader stopped so we can continue with flash commands next.
+                if (!busy) {
+                    busy = true
+                    scope.launch {
+                        try {
+                            val mac = withContext(Dispatchers.IO) { readMacAddressFromEfuse() }
+                            if (mac == null) {
+                                Toast.makeText(context, "Read MAC failed", Toast.LENGTH_SHORT).show()
+                                deviceInfo = "Read MAC failed (is chip in download mode?)"
+                                SerialSession.bootloaderReady = false
+                                // Resume normal reader so app isn’t stuck
+                                SerialSession.startIO()
+                            } else {
+                                Toast.makeText(context, "MAC: $mac", Toast.LENGTH_SHORT).show()
+                                deviceInfo = "Base MAC: $mac"
+                                // Keep bootloaderReady true; keep reader stopped so we can continue with flash commands next.
+                            }
+                        } finally {
+                            busy = false
+                        }
                     }
                 }
             },
-            enabled = bootloaderReady
+            enabled = SerialSession.bootloaderReady && !busy
         ) {
             Text("Read MAC")
+        }
+
+        // nightmareish stack of brackets
+        Button(
+            enabled = SerialSession.bootloaderReady && !busy,
+            onClick = {
+                if (!busy) {
+                    busy = true
+                    scope.launch {
+                        try {
+                            deviceInfo = withContext(Dispatchers.IO) {
+                                when {
+                                    !attachDefaultFlash() -> "Flash attaching failed"
+                                    !setFlashParameters(2 * 1024 * 1024) -> "Setting flash parameters failed"
+                                    else -> "Flash prepared (2MB)"
+                                }
+                            }
+                        } finally {
+                            busy = false
+                        }
+                    }
+                }
+            }
+        ) {
+            Text("Prepare flash")
+        }
+
+        // button of doom and despair
+        Button(
+            enabled = SerialSession.bootloaderReady && !busy,
+            onClick = {
+                if (!busy && SerialSession.bootloaderReady) {
+                    busy = true
+
+                    // Capture the connection for the entire three-file operation.
+                    val flashingPort = SerialSession.port
+                    SerialSession.bootloaderReady = false
+
+                    scope.launch {
+                        var stage = "Loading heartbeat files"
+
+                        try {
+                            deviceInfo = stage
+
+                            data class FlashImage(
+                                val name: String,
+                                val offset: Int,
+                                val regionSize: Int,
+                                val bytes: ByteArray
+                            )
+
+                            // Load and validate ALL files before erasing anything.
+                            val images = withContext(Dispatchers.IO) {
+                                val layout = listOf(
+                                    Triple("bootloader.bin", 0x1000, 0x7000),
+                                    Triple("partition-table.bin", 0x8000, 0x1000),
+                                    Triple("heartbeat.bin", 0x10000, 0x100000)
+                                )
+
+                                layout.map { (name, offset, regionSize) ->
+                                    val bytes = context.assets
+                                        .open("heartbeat/$name")
+                                        .use { it.readBytes() }
+
+                                    require(bytes.isNotEmpty()) {
+                                        "$name is empty"
+                                    }
+                                    require(bytes.size <= regionSize) {
+                                        "$name exceeds its destination region"
+                                    }
+
+                                    FlashImage(name, offset, regionSize, bytes)
+                                }
+                            }
+
+                            for (image in images) {
+                                check(
+                                    flashingPort != null &&
+                                            SerialSession.port === flashingPort
+                                ) {
+                                    "Serial connection changed"
+                                }
+
+                                stage = image.name
+                                deviceInfo = "${image.name}: preparing flash…"
+
+                                flashBinary(
+                                    image = image.bytes,
+                                    offset = image.offset,
+                                    regionSize = image.regionSize
+                                ) { written, total ->
+                                    withContext(Dispatchers.Main) {
+                                        val percent =
+                                            (written.toLong() * 100 / total).toInt()
+
+                                        deviceInfo = if (written == total) {
+                                            "${image.name}: verifying…"
+                                        } else {
+                                            "${image.name}: $percent%"
+                                        }
+                                    }
+                                }
+                            }
+
+                            deviceInfo =
+                                "All 3 files verified! Close and reopen serial, " +
+                                        "then tap EN without holding BOOT."
+
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            deviceInfo =
+                                "Flash failed during $stage: " +
+                                        (e.message ?: e.javaClass.simpleName)
+                        } finally {
+                            SerialSession.bootloaderReady = false
+                            busy = false
+                        }
+                    }
+                }
+            }
+        ) {
+            Text("Flash heartbeat")
         }
 
 
@@ -765,7 +994,7 @@ fun PolarRoboticsHub(modifier: Modifier = Modifier) {
         Row(modifier = modifier.fillMaxWidth()) {
             Button(onClick = {
                 openCh340OrRequestPermission(context)
-            }) {
+            }, enabled = !busy) {
                 Text("Open Serial Connection")
             }
 
@@ -773,7 +1002,7 @@ fun PolarRoboticsHub(modifier: Modifier = Modifier) {
 
             Button(onClick = {
                 SerialSession.closeConnection()
-            }) {
+            }, enabled = !busy) {
                 Text("Close Serial Connection")
             }
         }
